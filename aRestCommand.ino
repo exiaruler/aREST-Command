@@ -1,8 +1,3 @@
-/*
-  This a simple example of the aREST Library for the ESP8266 WiFi chip.
-  See the README file for more details.
-  Written in 2015 by Marco Schwartz under a GPL license.
-*/
 
 // Import required libraries
 #include <ESP8266WiFi.h>
@@ -15,11 +10,13 @@
 #include <RGBLed.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClient.h>
-
+#include <ArduinoWebsockets.h>
+#include <ArduinoJson.h>
 
 // Create aREST instance
+using namespace websockets;
 aREST rest = aREST();
-
+WebsocketsClient socketClient;
 // WiFi parameters
 const char* ssid = "veda";
 const char* password = "gn002dynames";
@@ -31,8 +28,13 @@ WiFiServer server(LISTEN_PORT);
 
 // Variables to be exposed to the API
 // global variable
-String ok="OK";
+String boardKey="";
 String serverURL="http://192.168.1.211:8080";
+String portConnect="";
+boolean socketActive=false;
+int socketStart=0;
+int socketTimeout=0;
+
 WiFiClient client;
 HTTPClient http;
 // global operations
@@ -43,8 +45,6 @@ boolean debug=false;
 
 // global methods 
 String servoMove(Servo servo,int pin,int start,int move,int gap,int between,int loop,boolean detach=false){
-  
-  
   if(gap<0){
     gap=1000;
   }
@@ -74,23 +74,28 @@ String servoMove(Servo servo,int pin,int start,int move,int gap,int between,int 
   if(!detach){
     servo.detach();
   }
-  return ok;
+  return "OK";
 }
-void setColour(int R,int pinR, int G,int pinG, int B,int pinB) {
-  analogWrite(pinR,R);
-  analogWrite(pinG,G);
-  analogWrite(pinB,B);
+// send http get request
+String httpRequestGet(String url){
+  String response="{}";
+  http.begin(client,url);
+  int httpResponseCode = http.GET();
+  if(httpResponseCode==200){
+    response=http.getString();
+  }
+  http.end();
+  return response;
 }
-void setColourCommonAn(int pinR,int pinG,int pinB,int postivePin,int R,int G,int B,int current=255){
-  analogWrite(postivePin,current);
-  RGBLed led(pinR,pinG,pinB, RGBLed::COMMON_ANODE);
-  led.setColor(R, G, B);
-}
-void setLed(){
-  
+
+JsonDocument stringToJson(String jsonString){
+  JsonDocument json;
+  deserializeJson(json,jsonString);
+  return json;
 }
 struct backgroundVariables{
   int x=1;
+  int output=255;
   unsigned long d1;
   unsigned long d2;
   // fade
@@ -103,6 +108,7 @@ struct backgroundVariables{
   int red_direction= -1;
   int green_direction= 1;
   int blue_direction= -1;
+  int count=0;
 };
 // background task to run
 struct backgroundTask{
@@ -116,36 +122,85 @@ struct backgroundTask{
   int rgbGreen=0;
   int rgbBlue=0;
   String rgbType;
-  int rgbSet[3];
+  //
   int deduction=5;
-  int runTarget;
-  int count=0;
+  int runTarget=0;
+  int* rgbSet[3];
+  // used for server connection
+  boolean background=false;
   //
   backgroundVariables variables;
 };
 AFArray<backgroundTask> queue;
+AFArray<int> deleteQueue;
 backgroundTask task={};
 // add task
-int addTask(String device,String method,int pin,boolean rgb,int rgbPins [],String rgbType,int interval,int deduction=5,int start=1){
+int addTask(String device,String method,int pin,int interval,int deduction=5,int start=1,int output=255,int target=0){
   int index=0;
+  int rgbPins[3]={0,0,0};
   boolean exist=false;
   for(int i=0; i<queue.size(); i++){
     backgroundTask t=queue[i];
-    if(t.device==device&&t.pin==pin&&t.rgb==rgb&&t.rgbRed==rgbPins[0]&&t.rgbGreen==rgbPins[1]&&t.rgbBlue==rgbPins[2]){
+    if(t.device==device&&t.pin==pin){
       exist=true;
-      queue[i]={device,method,pin,rgb,interval,rgbPins[0],rgbPins[1],rgbPins[2],rgbType,deduction};
+      queue[i]={device,method,pin,false,interval,rgbPins[0],rgbPins[1],rgbPins[2],"",deduction,target};
       queue[i].variables.x=start;
+      queue[i].variables.output=output;
       break;
     }
   }
   if(!exist){
-    backgroundTask task={device,method,pin,rgb,interval,rgbPins[0],rgbPins[1],rgbPins[2],rgbType,deduction};
+    backgroundTask task={device,method,pin,false,interval,rgbPins[0],rgbPins[1],rgbPins[2],"",deduction,target};
     task.variables.x=start;
+    task.variables.output=output;
     queue.add(task);
     index=queue.size()-1;
     Serial.println("tasked added "+device+" "+method);
   }
   return index;
+}
+// add task RGB
+int addTaskRgb(String device,String method,String rgbType,int rgbPins [],int rgbSet [3],int interval,int deduction=5,int target=0){
+  int index=0;
+  boolean exist=false;
+  for(int i=0; i<queue.size(); i++){
+    backgroundTask t=queue[i];
+    if(t.device==device&&t.rgbRed==rgbPins[0]&&t.rgbGreen==rgbPins[1]&&t.rgbBlue==rgbPins[2]&&t.rgbType==rgbType){
+      exist=true;
+      queue[i]={device,method,0,true,interval,rgbPins[0],rgbPins[1],rgbPins[2],rgbType,deduction,target,rgbSet};
+      break;
+    }
+  }
+  if(!exist){
+    backgroundTask task={device,method,0,true,interval,rgbPins[0],rgbPins[1],rgbPins[2],rgbType,deduction,target,rgbSet};
+    queue.add(task);
+    index=queue.size()-1;
+    Serial.println("tasked added "+device+" "+method);
+  }
+  return index;
+}
+
+void removeByIndex(int index){
+  if(queue.size()>0){
+    backgroundTask test=queue[index];
+    int startIndex=index;
+    // if the index is the last element minus it
+    if(queue.size()-1==startIndex){
+      startIndex=index-1;
+    }
+    int indexPlus=index+1;
+    int endQueue=queue.size()-1;
+    if(queue.size()==1){
+      queue.reset();
+    }else if(queue.size()>1){
+      
+      AFArray<backgroundTask> splitA=queue.slice(0,startIndex);
+      AFArray<backgroundTask> splitB=queue.slice(indexPlus+1,endQueue);
+      Serial.println(splitA.size());
+      Serial.println(splitB.size());
+      queue=splitA+splitB;
+    }
+  }
 }
 // remove device from queue
 AFArray<backgroundTask> removeDeviceTask(String device){
@@ -165,15 +220,13 @@ AFArray<backgroundTask> removeDeviceTask(String device){
 void clearQueue(){
   queue.reset();
 }
-
-// for command base
-void addTaskComDev(String device,String method,int pin,boolean rgb,int rgbR,int rgbB,int rgbG,int interval){
-  removeDeviceTask(device);
-  int pins [3]={rgbR,rgbG,rgbB};
-  //addTask(device,method,pin,rgb,pins,interval);
+void countTimes(int index){
+  if(task.variables.count==task.runTarget&&task.runTarget!=0){
+      deleteQueue.add(index);
+  }
+  task.variables.count++;
 }
-
-void ledLit(int pin,long interval){
+void ledOnTimed(int pin,long interval,int index){
   digitalWrite(pin,task.variables.x);
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
@@ -181,11 +234,11 @@ void ledLit(int pin,long interval){
     task.variables.x=1-task.variables.x;
     task.variables.d1=millis();
     digitalWrite(pin,task.variables.x);
-    removeDeviceTask(task.device);
+    countTimes(index);
   }
   task.variables.d1,task.variables.d2;
 }
-void ledFade(int pin,long interval){
+void ledFade(int pin,long interval,int index){
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
   if ( task.variables.d2-task.variables.d1 >= interval){
@@ -196,20 +249,22 @@ void ledFade(int pin,long interval){
       task.deduction=-task.deduction;
     }
     analogWrite(pin,task.variables.brightness);
+    countTimes(index);
   }
   task.variables.d1,task.variables.d2;
 }
-void ledBlinkBackGround(int pin,long interval){
+void ledBlinkBackGround(int pin,long interval,int index){
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
   if ( task.variables.d2-task.variables.d1 >= interval){
     task.variables.x=1-task.variables.x;
     task.variables.d1=millis();
     digitalWrite(pin,task.variables.x);
+    countTimes(index);
   }
-   task.variables.d1,task.variables.d2;
+  task.variables.d1,task.variables.d2;
 }
-void ledBlinkRgb(int pin,long interval,int powerPin){
+void ledBlinkRgb(int pin,long interval,int powerPin,int index){
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
   if ( task.variables.d2-task.variables.d1 >= interval){
@@ -217,34 +272,29 @@ void ledBlinkRgb(int pin,long interval,int powerPin){
     task.variables.d1=millis();
     //digitalWrite(pin,task.x);
     digitalWrite(powerPin,task.variables.x);
-    
+    countTimes(index);
   }
    task.variables.d1,task.variables.d2;
 }
-void rgbFade(int interval){
+void rgbFade(int interval,int index){
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
   if ( task.variables.d2-task.variables.d1 >= interval){
     task.variables.x=1-task.variables.x;
     task.variables.d1=millis();
-    RGBLed led(task.rgbRed,task.rgbGreen,task.rgbBlue, RGBLed::COMMON_ANODE);
     int pins[3]={task.rgbRed,task.rgbGreen,task.rgbBlue};
     int output[3]={task.variables.red,task.variables.green,task.variables.blue};
-    analogWrite(task.pin,255);
-    //setRGBLightFade();
-    led.fadeIn(255, 0, 0, 5, 100);
-    led.fadeOut(255, 0, 0, 5, 100);
+    setRGBLightFade(task.rgbType,pins,output);
+    countTimes(index);
   }
    task.variables.d1,task.variables.d2;
 }
-void rgbCycle(int interval){
+void rgbCycle(int interval,int index){
   task.variables.d1,task.variables.d2;
   task.variables.d2=millis();
   if ( task.variables.d2-task.variables.d1 >= interval){
     task.variables.x=1-task.variables.x;
     task.variables.d1=millis();
-    //RGBLed led(task.rgbRed,task.rgbGreen,task.rgbBlue, RGBLed::COMMON_ANODE);
-    //analogWrite(task.pin,255);
     task.variables.red = task.variables.red + task.variables.red_direction;   //changing values of LEDs
     task.variables.green = task.variables.green + task.variables.green_direction;
     task.variables.blue = task.variables.blue + task.variables.blue_direction;
@@ -261,15 +311,34 @@ void rgbCycle(int interval){
     {
       task.variables.blue_direction = task.variables.blue_direction * -1;
     }
-    //led.setColor(task.variables.red,task.variables.green,task.variables.blue);
     int pins[3]={task.rgbRed,task.rgbGreen,task.rgbBlue};
     int output[3]={task.variables.red,task.variables.green,task.variables.blue};
     setRGBLight(task.rgbType,pins,output);
+    countTimes(index);
   }
   if(debug){
     Serial.println("rgbCycle executed");
   }
   task.variables.d1,task.variables.d2;
+}
+// internal schedule
+// request settings at interval times
+void requestConnection(int interval){
+  task.variables.d1,task.variables.d2;
+  task.variables.d2=millis();
+  if ( task.variables.d2-task.variables.d1 >= interval){
+    String request=httpRequestGet(serverURL+"/");
+    
+  }
+  task.variables.d1,task.variables.d2;
+}
+// open websocket connection within certain time
+void openSocketConnection(){
+
+}
+// close websocket connection within certain time
+void closeSocketTime(){
+
 }
 
 // led blink function
@@ -290,6 +359,17 @@ void ledBlink(int pin,long interval){
 int calculateTime(int t){
  int min=1000*60;
  return min*t;
+}
+
+// websocket function
+void startConnection(String url){
+  socketClient.connect(url);
+}
+void sendMessage(){
+
+}
+void closeConnection(){
+  socketClient.close();
 }
 
 // Declare functions to be exposed to the API
@@ -374,6 +454,7 @@ int stringToPinIntDig(String pin){
     int pin;
   };
   digpin arr[]={
+  {"D0",D0},
   {"D1",D1},
   {"D2",D2},
   {"D3",D3},
@@ -381,9 +462,7 @@ int stringToPinIntDig(String pin){
   {"D5",D5},
   {"D6",D6},
   {"D7",D7},
-  {"D8",D8},
-  {"D9",D9},
-  {"D10",D10},
+  {"D8",D8}
   };
   int length = sizeof(arr) / sizeof(arr[0]);
   for(int i=0; i<length; i++){
@@ -416,15 +495,22 @@ void setRGBLight(String type,int pins [],int output[]){
 void setRGBLightFade(String type,int pins [],int output[]){
   if(type.equals("COMMON_ANODE")){
       RGBLed led(pins[0],pins[1],pins[2],RGBLed::COMMON_ANODE);
-      led.setColor(output[0],output[1],output[2]);
+      led.fadeIn(output[0],output[1],output[2],task.deduction,task.interval);
+      led.fadeOut(output[0],output[1],output[2],task.deduction,task.interval);
     }
     if(type.equals("COMMON_CATHODE")){
       setPinMode(pins,OUTPUT);
       RGBLed led(pins[0],pins[1],pins[2],RGBLed::COMMON_CATHODE);
-      led.setColor(output[0],output[1],output[2]);
+      led.fadeIn(output[0],output[1],output[2],task.deduction,task.interval);
+      led.fadeOut(output[0],output[1],output[2],task.deduction,task.interval);
     }
 }
-
+String returnParameterValue(String keyValue){
+  String value="";
+  int equalIndex=keyValue.indexOf('=');
+  value=keyValue.substring(equalIndex+1);
+  return value;
+}
 // return each param variable in array
 AFArray<String> parameterArray(int paramsSize,String param){
   AFArray<String> arr;
@@ -458,61 +544,7 @@ AFArray<String> parameterArray(int paramsSize,String param){
   Serial.println("split end "+split);
   return arr;
 }
-// case of methods
-int methodCheck(String method,String param){
-  int r=0;
-  if(method=="setColourCommonAn"){
-    AFArray<String> paramArr=parameterArray(8,param);
-    int rPin=stringToPinIntDig(paramArr[0]);
-    int gPin=stringToPinIntDig(paramArr[1]);
-    int bPin=stringToPinIntDig(paramArr[2]);
-    int postive=stringToPinIntDig(paramArr[3]);
-    int r=paramArr[4].toInt();
-    int g=paramArr[5].toInt();
-    int b=paramArr[6].toInt();
-    int current=paramArr[7].toInt();
-    r=1;
-    setColourCommonAn(rPin,gPin,bPin,postive,r,g,b,current);
-    
-  }
-  
-  if(method=="addTaskComDev"){
-    AFArray<String> paramArr=parameterArray(8,param);
-    String device=paramArr[0];
-    String methodA=paramArr[1];
-    int pin=stringToPinIntDig(paramArr[2]);
-    boolean rgb=stringToBool(paramArr[3]);
-    int rpin=stringToPinIntDig(paramArr[4]);
-    int gpin=stringToPinIntDig(paramArr[5]);
-    int bpin=stringToPinIntDig(paramArr[6]);
-    int interval=paramArr[6].toInt();
-    r=1;
-    addTaskComDev(device,methodA,pin,rgb,rpin,gpin,bpin,interval);
-    
-  }
-  if(method=="debug"){
-    if(param=="true"){
-      r=1;
-      debug=true;
-    }else if(param=="false"){
-      r=1;
-      debug=false;
-    }
-  }
-  return r;
-}
-// custom commands 
-int command(String input){
-  int r=0;
-  if(input!="1"){
-    Serial.println(input);
-    String* arr=returnMethodandParam(input);
-    String method=arr[0];
-    String para=arr[1];
-    r=methodCheck(method,para);
-  }
-  return r;
-}
+
 // set led brightness
 // postive pin,brightness
 int setLED(String param){
@@ -529,40 +561,52 @@ int setLED(String param){
   return r;
 }
 // set led animation
-// method,device name,postive pin,delay,deduction,start
+// method,device name,postive pin,delay,deduction,start,output,target
 int setLEDAnimation(String param){
   int r=0;
-  AFArray<String> paramArr=parameterArray(6,param);
-  if(paramArr.size()==6){
+  AFArray<String> paramArr=parameterArray(8,param);
+  if(paramArr.size()==8){
     String method=paramArr[0];
     String deviceName=paramArr[1];
     int positivePin=stringToPinIntDig(paramArr[2]);
     int delay=paramArr[3].toInt();
     int deduction=paramArr[4].toInt();
     int start=paramArr[5].toInt();
+    int output=paramArr[6].toInt();
+    int target=paramArr[7].toInt();
     int pins[1]={positivePin};
     setPinMode(pins,OUTPUT);
-    int pinsArr[3]={};
-    addTask(deviceName,method,positivePin,false,pinsArr,"",delay,deduction,start);
+    addTask(deviceName,method,positivePin,delay,deduction,start,output,target);
     r=1;
   }
   return r;
 }
 // set rgb animation
-//
+// method,device name,rgb type,red pin,green pin,blue pin,delay,set red,set green,set blue
 int setRGBAnimation(String param){
   int r=0;
-  AFArray<String> paramArr=parameterArray(7,param);
-  if(paramArr.size()==7){
+  AFArray<String> paramArr=parameterArray(11,param);
+  if(paramArr.size()==11){
     String method=paramArr[0];
     String deviceName=paramArr[1];
     String type=paramArr[2];
     int rPin=stringToPinIntDig(paramArr[3]);
     int gPin=stringToPinIntDig(paramArr[4]);
     int bPin=stringToPinIntDig(paramArr[5]);
-    int delay=paramArr[6].toInt();
+    int interval=paramArr[6].toInt();
+    int red=0;
+    int green=0;
+    int blue=0;
+    int redSet=paramArr[7].toInt();
+    int greenSet=paramArr[8].toInt();
+    int blueSet=paramArr[9].toInt();
+    int target=paramArr[10].toInt();
+    if(redSet>0) red=redSet;
+    if(greenSet>0) green=greenSet;
+    if(blueSet>0) blue=blueSet;
     int pins[3]={rPin,gPin,bPin};
-    addTask(deviceName,method,0,true,pins,type,delay);
+    int setRgb[3]={red,green,blue};
+    addTaskRgb(deviceName,method,type,pins,setRgb,interval,0,target);
     r=1;
   }
   return r;
@@ -584,20 +628,6 @@ int setRGB(String param){
     int output[3]={red,green,blue};
     setRGBLight(type,pins,output);
     r=1;
-    /*
-    if(type.equals("COMMON_ANODE")){
-      RGBLed led(rPin,gPin,bPin,RGBLed::COMMON_ANODE);
-      led.setColor(red,green,blue);
-      r=1;
-    }
-    if(type.equals("COMMON_CATHODE")){
-      int pins[3]={rPin,gPin,bPin};
-      setPinMode(pins,OUTPUT);
-      RGBLed led(rPin,gPin,bPin, RGBLed::COMMON_CATHODE);
-      led.setColor(red,green,blue);
-      r=1;
-    }
-    */
   }
   return r;
 }
@@ -632,7 +662,7 @@ int clearQueueAction(String param){
     clearQueue();
     r=1;
   }
-  if(method=="removeDeviceTask"){
+  if(method=="removedevicetask"){
     removeDeviceTask(para);
     r=1;
   }
@@ -701,33 +731,6 @@ void setup(void)
   // Init variables and expose them to REST API
   backgroundRunning=false, uploadMode=false;
   queryData="";
-
-
-  // device framework
-  rest.variable("background",&backgroundRunning);
-  rest.variable("query",&queryData);
-   // device readings
-  //rest.variable("Warning",&warning);
-  // Function to be exposed
-  // config route
-  rest.function("query",getDeviceData);
-  rest.function("upload",uploadModeConfig);
-  rest.function("clear-queue",clearQueueAction);
-  //rest.function("command",command);
-  // routes
-  rest.function("set-led",setLED);
-  rest.function("led-animation",setLEDAnimation);
-  rest.function("set-rgb",setRGB);
-  rest.function("set-servo",moveServo);
-
-  // test route
-  //rest.function("backgroundrun",backgroundrun);
-  // Give name & ID to the device (ID should be 6 characters long)
-  rest.set_id("In3|6");
-  rest.set_name("aREST Command");
-   // TEMP
-  
-  //
   // Connect to WiFi
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -788,7 +791,26 @@ void setup(void)
 
   // Print the IP address
   Serial.println(WiFi.localIP());
+  
   startRequest();
+  // device framework
+  rest.variable("background",&backgroundRunning);
+  rest.variable("query",&queryData);
+   // device readings
+  // Function to be exposed
+  // config route
+  rest.function("query",getDeviceData);
+  rest.function("upload",uploadModeConfig);
+  rest.function("clear-queue",clearQueueAction);
+  // routes
+  rest.function("set-led",setLED);
+  rest.function("led-animation",setLEDAnimation);
+  rest.function("set-rgb",setRGB);
+  rest.function("rgb-animation",setRGBAnimation);
+  rest.function("set-servo",moveServo);
+  // Give name & ID to the device (ID should be 6 characters long)
+  rest.set_id("In3|6");
+  rest.set_name("aREST Command");
   
 }
 
@@ -835,26 +857,39 @@ void background(){
     
     for(int i=0; i<queue.size(); i++){
       task=queue[i];
-      if(task.method=="ledBlinkBackGround"){
-        ledBlinkBackGround(task.pin,task.interval);
+
+      if(task.method=="ledblinkbackground"){
+        ledBlinkBackGround(task.pin,task.interval,i);
         queue[i]=task;
       }
-      if(task.method=="ledFade"){
-        ledFade(task.pin,task.interval);
+      if(task.method=="ledfade"){
+        ledFade(task.pin,task.interval,i);
         queue[i]=task;
       }
-      if(task.method=="ledBlinkRgb"){
-        ledBlinkRgb(task.rgbRed,task.interval,task.pin);
+      if(task.method=="ledlighttimed"){
+        ledOnTimed(task.pin,task.interval,i);
         queue[i]=task;
       }
-      if(task.method=="rgbCycle"){
-        rgbCycle(task.interval);
-        queue[i]=task;
+      if(task.rgb){
+        if(task.method=="ledblinkrgb"){
+          ledBlinkRgb(task.rgbRed,task.interval,task.pin,i);
+          queue[i]=task;
+        }
+        if(task.method=="rgbcycle"){
+          rgbCycle(task.interval,i);
+          queue[i]=task;
+        }
+        if(task.method=="rgbfade"){
+          rgbFade(task.interval,i);
+          queue[i]=task;
+        }
       }
-      if(task.method=="rgbFade"){
-        rgbFade(task.interval);
-        queue[i]=task;
+    }
+    if(deleteQueue.size()>0){
+      for(int dq=0; dq<deleteQueue.size(); dq++){
+        removeByIndex(deleteQueue[dq]);
       }
+      deleteQueue.reset();
     }
     
   }
